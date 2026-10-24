@@ -1,10 +1,15 @@
 import type { Request, Response } from 'express';
+import { Account, MuxedAccount } from '@stellar/stellar-sdk';
+import { CopyTradeStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError } from '../utils/response.util';
 import { checkAccess } from '../services/subscription.service';
 import { CONTRACTS } from '../config/contracts';
+import { config } from '../config';
 import { toDisplayUsdc } from '../lib/amounts';
 import { confirmCopyTradeSchema, copyTradeSchema } from '../validators/trade.validator';
+import { confirmCopyTrade as serviceConfirmCopyTrade } from '../services/copy-trade.service';
+import { AppError } from '../middlewares/error.middleware';
 
 /**
  * POST /trade/copy
@@ -29,6 +34,23 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
   }
 
   const { traceId, marketId, amountRaw } = parsed.data.body;
+
+  // Rate limiting / row spam prevention: cap open PENDING / CONFIRMING copy trades
+  const openCount = await prisma.copyTrade.count({
+    where: {
+      userId: req.user.userId,
+      status: { in: [CopyTradeStatus.PENDING, CopyTradeStatus.CONFIRMING] },
+    },
+  });
+  if (openCount >= config.COPY_TRADE_MAX_PENDING) {
+    sendError(
+      res,
+      429,
+      'COPY_TRADE_LIMIT_REACHED',
+      `You have ${openCount} unconfirmed copy trades. Complete or wait for them to expire before creating more.`,
+    );
+    return;
+  }
 
   const access = await checkAccess(req.user.userId, traceId);
   if (!access.hasAccess) {
@@ -64,27 +86,40 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
     return;
   }
   const direction = trace.edge > 0 ? 'YES' : 'NO';
+  const expiresAt = new Date(Date.now() + config.COPY_TRADE_TTL_MINUTES * 60 * 1000);
+
+  // #46: a custodial sub-user shares the pooled base account. Return the muxed
+  // address so the client can sign from the sub-identity where one exists.
+  const userWalletMuxed =
+    req.user.subId != null && req.user.subIdKind === 'MUXED'
+      ? new MuxedAccount(new Account(req.user.walletAddress, '0'), req.user.subId).accountId()
+      : null;
 
   const copyTrade = await prisma.copyTrade.create({
     data: {
-      userId:    req.user.userId,
+      userId:         req.user.userId,
+      followerWallet: req.user.walletAddress,
       traceId,
       marketId,
+      outcome:        direction,
       direction,
-      amount:    toDisplayUsdc(BigInt(amountRaw)),
+      amount:         toDisplayUsdc(BigInt(amountRaw)),
       amountRaw,
-      status:    'PENDING',
+      status:         CopyTradeStatus.PENDING,
+      expiresAt,
     },
   });
 
   sendSuccess(res, {
     copyTradeId: copyTrade.id,
+    expiresAt,
     transactionPayload: {
       contractId:      CONTRACTS.marketCore,
       onChainMarketId: market.onChainMarketId.toString(),
       outcome:         direction === 'YES' ? 'Yes' : 'No',
       collateralInRaw: amountRaw,
       userWallet:      req.user.walletAddress,
+      userWalletMuxed,
       traceReference:  trace.ipfsCid,
     },
     instructions: 'Quote, then sign market_core.buy with min_shares_out from the quote. ' +
@@ -94,7 +129,7 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
 
 /**
  * PATCH /trade/copy/:id/confirm
- * Records the hash of the user's buy transaction.
+ * Records and verifies the hash of the user's buy transaction on-chain.
  */
 export async function confirmCopyTrade(req: Request, res: Response): Promise<void> {
   if (!req.user) {
@@ -109,16 +144,23 @@ export async function confirmCopyTrade(req: Request, res: Response): Promise<voi
     return;
   }
 
-  const copyTrade = await prisma.copyTrade.findUnique({ where: { id } });
-  if (!copyTrade || copyTrade.userId !== req.user.userId) {
-    sendError(res, 404, 'COPY_TRADE_NOT_FOUND', 'Copy trade not found');
-    return;
+  try {
+    const updated = await serviceConfirmCopyTrade(
+      req.user.userId,
+      req.user.walletAddress,
+      id,
+      parsed.data.txHash,
+    );
+    sendSuccess(res, updated);
+  } catch (err: any) {
+    if (err.statusCode === 202 || err.code === 'COPY_TRADE_PENDING') {
+      sendSuccess(res, { status: 'CONFIRMING', retryAfterSeconds: 5 }, 202);
+      return;
+    }
+    if (err instanceof AppError) {
+      sendError(res, err.statusCode, err.code, err.message, err.details);
+      return;
+    }
+    sendError(res, 500, 'INTERNAL_SERVER_ERROR', err.message || 'Confirmation failed');
   }
-
-  const updated = await prisma.copyTrade.update({
-    where: { id },
-    data:  { txHash: parsed.data.txHash.toLowerCase(), status: 'EXECUTED' },
-  });
-
-  sendSuccess(res, updated);
 }

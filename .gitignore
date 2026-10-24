@@ -1,6 +1,9 @@
 node_modules
 # Keep environment variables out of version control
 .env
+*.channels.secrets
+channels.secrets*
+.channels*
 
 /src/generated/prisma
 dist-tests
@@ -8,6 +11,8 @@ dist-tests
 recovery.dat
 
 # Build output and local artefacts
+.ipfs-local/
 dist/
 *.log
 .DS_Store
+eval-results/

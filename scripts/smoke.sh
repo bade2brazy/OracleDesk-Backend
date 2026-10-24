@@ -17,6 +17,9 @@ need() { node -e "const j=JSON.parse(require('fs').readFileSync(0));if(!j.ok){co
 step "GET /health"
 curl -fsS "$API/health" | need 'console.log(j.data.status)'
 
+step "GET /readyz"
+curl -fsS "$API/readyz" | need 'console.log(j.data.status)'
+
 step "throwaway keypair"
 KEYS=$(node -e 'const {Keypair}=require("@stellar/stellar-sdk");const k=Keypair.random();console.log(k.publicKey()+" "+k.secret())')
 ADDRESS=${KEYS% *}; SECRET=${KEYS#* }

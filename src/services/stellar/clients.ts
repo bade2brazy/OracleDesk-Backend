@@ -16,12 +16,13 @@ export const rpcServer = new rpc.Server(config.STELLAR_RPC_URL, {
 
 type Signer = Pick<ClientOptions, 'publicKey' | 'signTransaction' | 'signAuthEntry'>;
 
-function baseOptions(contractId: string, signer: Signer = {}): ClientOptions {
+export function baseOptions(contractId: string, signer: Signer = {}): ClientOptions {
   return {
     contractId,
     rpcUrl: config.STELLAR_RPC_URL,
     networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE,
     allowHttp: config.STELLAR_RPC_URL.startsWith('http://'),
+    ...({ timeoutInSeconds: Math.ceil(config.TIMEOUT_RPC_WRITE_MS / 1000) } as object),
     ...signer,
   };
 }
@@ -55,6 +56,10 @@ export function agentSigner(): Signer {
 }
 
 export const agentClients = {
-  treasury: () => new TreasuryClient(baseOptions(CONTRACTS.treasury, agentSigner())),
-  reasoningRegistry: () => new ReasoningRegistryClient(baseOptions(CONTRACTS.reasoningRegistry, agentSigner())),
+  // The agent is only the fee source for the resolver: both calls are
+  // permissionless (#90).
+  resolver: (signer: Signer = agentSigner()) => new ResolverClient(baseOptions(CONTRACTS.resolver, signer)),
+  treasury: (signer: Signer = agentSigner()) => new TreasuryClient(baseOptions(CONTRACTS.treasury, signer)),
+  reasoningRegistry: (signer: Signer = agentSigner()) =>
+    new ReasoningRegistryClient(baseOptions(CONTRACTS.reasoningRegistry, signer)),
 };

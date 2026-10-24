@@ -6,6 +6,10 @@
   "scripts": {
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test --test-concurrency=1 dist-tests/tests/*.test.js",
+    "test:integration": "npm run build:test && node --test --test-concurrency=4 --test-global-setup=dist-tests/tests/integration/global-setup.js dist-tests/tests/integration/*.int.test.js",
+    "test:x402:prepare": "npm ci --prefix contracts/oracledesk-stellar/x402 --omit=optional --no-audit --no-fund",
+    "test:e2e:x402": "npm run test:x402:prepare && npm run build:test && node --test --test-concurrency=1 dist-tests/tests/x402-e2e.test.js",
+    "test:all": "npm test && npm run test:integration",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "npm run build && node dist/server.js",
@@ -14,9 +18,13 @@
     "prisma:studio": "prisma studio",
     "sync:contracts": "node scripts/sync-contracts.mjs",
     "check:contracts": "node scripts/sync-contracts.mjs --check",
-    "gen:schemas": "node scripts/gen-schemas.mjs",
-    "check:schemas": "node scripts/gen-schemas.mjs --check",
-    "pnl:rebuild": "npx tsx scripts/rebuild-wallet-pnl.ts"
+    "backtest": "node -r ts-node/register/transpile-only scripts/backtest.ts",
+    "verify:report": "node -r ts-node/register/transpile-only scripts/verify-report.ts",
+    "lint:migrations": "bash scripts/lint-migrations.sh",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:reset": "prisma migrate reset --force --skip-seed && npm run db:seed",
+    "snapshot:export": "tsx scripts/snapshot-export.ts",
+    "reconcile:post-restore": "tsx scripts/post-restore-reconcile.ts"
   },
   "keywords": [],
   "author": "",
@@ -25,6 +33,7 @@
     "@anthropic-ai/sdk": "~0.96.0",
     "@google/generative-ai": "~0.24.1",
     "@prisma/client": "~6.19.3",
+    "@socket.io/redis-streams-adapter": "0.3.1",
     "@stellar/stellar-sdk": "^16.3.1",
     "axios": "~1.16.1",
     "bcrypt": "~6.0.0",
@@ -53,6 +62,8 @@
     "zod": "~4.4.3"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.2.1",
+    "@testcontainers/redis": "^12.2.1",
     "@types/bcrypt": "~6.0.0",
     "@types/compression": "~1.8.1",
     "@types/cors": "~2.8.19",
@@ -61,9 +72,14 @@
     "@types/jsonwebtoken": "~9.0.10",
     "@types/morgan": "~1.9.10",
     "@types/node": "~25.8.0",
+    "@types/pg": "^8.23.1",
     "@types/uuid": "~10.0.0",
     "nodemon": "~3.1.14",
+    "pg": "^8.23.1",
+    "socket.io-client": "4.8.3",
+    "testcontainers": "^12.2.1",
     "ts-node-dev": "~2.0.0",
+    "tsx": "^4.23.15",
     "typescript": "~6.0.3"
   }
 }

@@ -1,0 +1,4 @@
+# Squawk configuration for scripts/lint-migrations.sh (#104).
+# Rules are suppressed per migration through prisma/migration-allowlist.json,
+# never here. Keep this list empty.
+excluded_rules = []

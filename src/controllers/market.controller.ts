@@ -1,5 +1,7 @@
 import type { Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
+import { bindDetached } from '../lib/context';
 import { v4 as uuidv4 } from 'uuid';
 import type { JobRecord } from '../types';
 import { JobStatus } from '../types';
@@ -8,7 +10,7 @@ import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { generateMarketSchema, listMarketsSchema } from '../validators/market.validator';
 import { toContractCategory } from '../lib/categories';
 import { parseU64 } from '../lib/amounts';
-import { getOnChainMarket, printable } from '../services/chain.service';
+import { getOnChainMarketCached, printable } from '../services/chain.service';
 import { marketStatusView } from '../services/oracle.service';
 import { priceYesBps } from '../generated/fpmm';
 import {
@@ -18,6 +20,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { AppError } from '../middlewares/error.middleware';
+import { assertAgentActive } from '../services/agent-controls.service';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
@@ -53,6 +56,21 @@ function pruneJobTracker(): void {
       jobTracker.delete(id);
     }
   }
+}
+
+export function buildMarketsWhere(query: {
+  status?: string;
+  category?: string;
+  currency?: string;
+  onChain?: string;
+}): Prisma.MarketWhereInput {
+  return {
+    ...(query.status ? { status: query.status as MarketStatus } : {}),
+    ...(query.category ? { category: query.category as MarketCategory } : {}),
+    ...(query.currency ? { settlementCurrency: query.currency as SettlementCurrency } : {}),
+    ...(query.onChain === 'true' ? { onChainMarketId: { not: null } } : {}),
+    ...(query.onChain === 'false' ? { onChainMarketId: null } : {}),
+  };
 }
 
 /**
@@ -94,25 +112,7 @@ export async function listMarkets(
     limit: l,
   });
 
-  const where: Prisma.MarketWhereInput = {
-  ...(status
-    ? { status: status as MarketStatus }
-    : {}),
-
-  ...(category
-    ? { category: category as MarketCategory }
-    : {}),
-
-  ...(currency
-    ? {
-        settlementCurrency:
-          currency as SettlementCurrency,
-      }
-    : {}),
-
-  ...(onChain === 'true' ? { onChainMarketId: { not: null } } : {}),
-  ...(onChain === 'false' ? { onChainMarketId: null } : {}),
-};
+  const where = buildMarketsWhere(parsed.data.query);
 
   const [markets, total] = await Promise.all([
     prisma.market.findMany({
@@ -205,6 +205,9 @@ export async function triggerMarketGeneration(
     return;
   }
 
+  // A paused market maker answers 423 immediately instead of starting a job (#79).
+  await assertAgentActive('MARKET_MAKER');
+
   const jobId = uuidv4();
 
   // Prune old jobs to keep memory bounded
@@ -219,25 +222,23 @@ export async function triggerMarketGeneration(
 
   // ── Persist audit log ────────────────────────────────────────
 
-  prisma.agentLog
-    .create({
-      data: {
+  bindDetached(
+    () =>
+      writeAgentLog({
         agentType: 'MARKET_MAKER',
         level: 'INFO',
         action: 'GENERATION_JOB_STARTED',
-
-        data: {
-          jobId,
-        },
-      },
-    })
+        data: { jobId },
+      }),
+    { jobId },
+  )
     .catch(() => {
       // Non-blocking
     });
 
   // ── Run generation in background ─────────────────────────────
 
-  runMarketMakerCycle()
+  bindDetached(() => runMarketMakerCycle({ priority: 'admin' }), { jobId, kind: 'job' })
     .then((result: any) => {
       const existingJob = jobTracker.get(jobId);
 
@@ -407,12 +408,15 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
     return;
   }
-  const market = await getOnChainMarket(onChainMarketId);
+  const result = await getOnChainMarketCached(onChainMarketId, req.signal);
+  const market = result.value;
   sendSuccess(res, {
     onChainMarketId: raw,
     ...(printable({ ...market, status: undefined, category: market.category.tag }) as object),
     status: marketStatusView(market.status),
     yesBps: Number(priceYesBps(market.reserve_yes, market.reserve_no)),
     source: 'chain',
+    ledger: result.ledger,
+    cached: result.cached,
   });
 }

@@ -1,0 +1,135 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  pull-requests: read
+
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release commit
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    name: Build, sign and attest image
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tag }}
+          provenance: true
+          sbom: true
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign image
+        run: cosign sign --yes "${{ steps.meta.outputs.tag }}@${{ steps.build.outputs.digest }}"
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.tag }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  staging:
+    name: Deploy staging
+    needs: image
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: staging
+      namespace: oracledesk-staging
+      image: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+      digest: ${{ needs.image.outputs.digest }}
+      values_file: values-staging.yaml
+    secrets: inherit
+
+  staging-checks:
+    name: Staging post-deploy checks
+    needs: [image, staging]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Checks
+        env:
+          API_URL: ${{ vars.API_URL }}
+          READY_CHECKS: "3"
+          INDEXER_STATUS_URL: ${{ vars.INDEXER_STATUS_URL }}
+          MAX_INDEXER_LAG_LEDGERS: "120"
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+          KUBE_NAMESPACE: oracledesk-staging
+          DEPLOYMENTS: api indexer worker
+          DIGEST: ${{ needs.image.outputs.digest }}
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          echo "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          ./scripts/post-deploy-checks.sh
+
+  production:
+    name: Deploy production
+    needs: [image, staging-checks]
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: production
+      namespace: oracledesk
+      image: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+      digest: ${{ needs.image.outputs.digest }}
+      values_file: values-production.yaml
+    secrets: inherit
+
+  production-checks:
+    name: Production post-deploy checks
+    needs: [image, production]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Checks
+        env:
+          API_URL: ${{ vars.API_URL }}
+          READY_CHECKS: "5"
+          INDEXER_STATUS_URL: ${{ vars.INDEXER_STATUS_URL }}
+          MAX_INDEXER_LAG_LEDGERS: "120"
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+          KUBE_NAMESPACE: oracledesk
+          DEPLOYMENTS: api indexer worker
+          DIGEST: ${{ needs.image.outputs.digest }}
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          echo "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          ./scripts/post-deploy-checks.sh

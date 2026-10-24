@@ -2,7 +2,11 @@
 # throwaway values, not secrets: the ports are bound to 127.0.0.1.
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector is Postgres 16 plus the vector extension (#69). It is
+    # Debian-based (glibc) where postgres:16-alpine is musl, so a data volume
+    # created with the alpine image should be recreated (`docker compose down -v`),
+    # or its text indexes rebuilt with REINDEX, before switching.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: oracledesk
       POSTGRES_PASSWORD: oracledesk
@@ -20,5 +24,27 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 10
+  # Optional nightly backup loop (#146). Start with:
+  #   docker compose --profile backup up -d backup
+  backup:
+    image: postgres:16-alpine
+    profiles: ["backup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://oracledesk:oracledesk@postgres:5432/oracledesk
+      BACKUP_DIR: /backups
+      BACKUP_KEEP_DAILY: "7"
+      BACKUP_KEEP_WEEKLY: "4"
+    volumes:
+      - ./backups:/backups
+      - .:/repo:ro
+    entrypoint: >
+      sh -c "apk add --no-cache nodejs git >/dev/null &&
+      while true; do
+        cd /repo && DATABASE_URL=$$DATABASE_URL BACKUP_DIR=$$BACKUP_DIR ./scripts/backup.sh || true;
+        sleep 21600;
+      done"
 volumes:
   pgdata:

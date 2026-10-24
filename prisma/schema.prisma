@@ -52,6 +52,15 @@ enum TradeStatus {
   CANCELLED
 }
 
+enum CopyTradeStatus {
+  PENDING
+  CONFIRMING
+  EXECUTED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
 enum PositionStatus {
   OPEN
   CLOSED
@@ -74,6 +83,61 @@ enum SubscriptionStatus {
   LIMIT_REACHED
 }
 
+enum PaymentEventType {
+  DAILY_PASS
+  PER_TRACE
+  REFUND
+}
+
+enum PaymentEventStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REFUNDED
+}
+
+/// Server-issued payment intents (#52). OPEN -> PENDING_PAYMENT -> CONFIRMED,
+/// with FAILED / EXPIRED / REFUND_REQUIRED as terminal or manual-review states.
+enum PaymentIntentStatus {
+  OPEN
+  PENDING_PAYMENT
+  CONFIRMED
+  FAILED
+  EXPIRED
+  REFUND_REQUIRED
+}
+
+/// Admin refund lifecycle (#57). Transitions are enforced in the service:
+/// REQUESTED -> APPROVED -> PREPARED -> SUBMITTED -> CONFIRMED, plus REJECTED
+/// from REQUESTED and FAILED from PREPARED/SUBMITTED.
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PREPARED
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+enum GenerationJobStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum TraceAuditStatus {
+  VERIFIED
+  HASH_MISMATCH
+  UNAVAILABLE
+  UNKNOWN_TO_BACKEND
+  WRONG_MARKET
+  UNLINKED_IN_DB
+  NOT_ON_CHAIN
+  FOREIGN_AGENT
+  ARCHIVED
+}
+
 enum AgentType {
   MARKET_MAKER
   TRADER
@@ -88,10 +152,24 @@ enum LogLevel {
 
 // ─────────────────────────── MODELS ───────────────────────────
 
-/// Registered subscribers who pay for reasoning traces
+/// How a custodial sub-identity is expressed on the signed challenge (#46).
+/// `MUXED` is a CAP-27 / SEP-23 M… address; `MEMO` is a G… account with an id memo.
+enum SubIdKind {
+  MUXED
+  MEMO
+}
+
+/// Registered subscribers who pay for reasoning traces.
+///
+/// `walletAddress` is the base G… account that signs and pays; it is no longer
+/// unique so one pooled account can host many sub-users. `identityKey` is the
+/// unique login identity: `G…`, `G…#muxed:<id>` or `G…#memo:<id>`.
 model User {
   id            String         @id @default(uuid())
-  walletAddress String         @unique
+  walletAddress String
+  subId         String?
+  subIdKind     SubIdKind?
+  identityKey   String         @unique
   email         String?        @unique
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -100,6 +178,9 @@ model User {
   copyTrades    CopyTrade[]
   paymentEvents PaymentEvent[]
   spendingAllowance SpendingAllowance?
+  refunds       Refund[]
+  entitlementTokens EntitlementToken[]
+  x402Settlements X402Settlement[]
 
   @@index([walletAddress])
   @@map("users")
@@ -112,27 +193,53 @@ model Market {
   category           MarketCategory
   status             MarketStatus       @default(PENDING)
   settlementCurrency SettlementCurrency @default(USDC)
+  /// CHECK: markets_initial_yes_prob_range (initialYesProb >= 0 AND initialYesProb <= 1)
   initialYesProb     Float
+  /// CHECK: markets_current_yes_prob_range (currentYesProb IS NULL OR (currentYesProb >= 0 AND currentYesProb <= 1))
   currentYesProb     Float?
+  /// CHECK: markets_ci_shape (confidenceInterval is object with lower <= upper)
   confidenceInterval Json               // { lower: Float, upper: Float }
   expiryTimestamp    DateTime
   resolutionOracle   String?
   resolvedOutcome    Boolean?
   resolvedAt         DateTime?
+  /// CHECK: markets_min_liquidity_nonneg (minimumLiquidity >= 0)
   minimumLiquidity   Float              @default(100)
+  /// CHECK: markets_total_liquidity_nonneg (totalLiquidity >= 0)
   totalLiquidity     Float              @default(0)
+  /// CHECK: markets_onchain_id_nonneg (onChainMarketId IS NULL OR onChainMarketId >= 0)
   /// market-core u64 market id. Serialised as a decimal string in JSON.
   onChainMarketId    BigInt?            @unique
+  /// CHECK: markets_creation_tx_hash_format (creationTxHash IS NULL OR 64 hex chars)
   creationTxHash     String?
+  /// CHECK: markets_creation_inner_tx_hash_format (creationInnerTxHash IS NULL OR 64 hex chars)
+  /// Inner (pre-fee-bump) hash of the creation transaction (#38).
+  creationInnerTxHash String?
+  /// CHECK: markets_seed_amount_raw_digits (seedAmountRaw IS NULL OR digits only)
   /// Seed liquidity in 7-decimal USDC base units.
   seedAmountRaw      String?
+  /// CHECK: markets_question_hash_format (questionHash IS NULL OR 64 hex chars)
   /// sha256 (hex) of the canonical question JSON pinned at metaUri.
   questionHash       String?
   metaUri            String?
+  /// CHECK: markets_resolution_hash_format (resolutionHash IS NULL OR 64 hex chars)
   /// sha256(XDR(ResolutionSpec)) committed on-chain at creation (ADR 0001).
   resolutionHash     String?
   /// Revealed preimage of resolutionHash, kept so it can be registered with the resolver.
   resolutionSpec     Json?
+  /// Seed policy inputs, bounds, binding constraint and expected LP loss (#82).
+  seedPolicy         Json?
+  /// Highest ledger whose chain state this row reflects; guards writes from the indexer and the reconciler (#83).
+  chainSyncedLedger  Int?
+  lastReconciledAt   DateTime?          @db.Timestamptz(3)
+  /// Resolvability block pinned in question document v2 (source id, URL, measurable, comparator, threshold, deadline, instructions). Null for markets created before #74.
+  resolutionDetails  Json?
+  /// LlmProvenance of the call that proposed this market (#66). Null for older rows.
+  generationProvenance Json?
+  /// Embedding of the normalised question (#69), vector(768). Read and written with raw SQL only.
+  questionEmbedding  Unsupported("vector(768)")?
+  /// Model that produced questionEmbedding; vectors are compared only within one model.
+  embeddingModel     String?
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
@@ -141,26 +248,30 @@ model Market {
 
   trades         Trade[]
   positions      Position[]
+  hedgePositions Position[]          @relation("MarketHedgePositions")
   reasoningTraces ReasoningTrace[]
   copyTrades     CopyTrade[]
   agentLogs      AgentLog[]
+  creationAttempt MarketCreationAttempt?
 
   @@index([status])
   @@index([category])
   @@index([expiryTimestamp])
   @@index([settlementCurrency])
   @@index([resolvedAt])
+  @@index([lastReconciledAt])
+  @@index([resolutionSpec], type: Gin)
   @@map("markets")
 }
 
 // Background job for market generation process, tracking status and errors
 model MarketGenerationJob {
-  id          String   @id @default(cuid())
-  status      String   @default("PROCESSING")
-  marketId    String?  @unique
+  id          String              @id @default(cuid())
+  status      GenerationJobStatus @default(PROCESSING)
+  marketId    String?             @unique
   traceId     String?
   error       String?
-  startedAt   DateTime @default(now())
+  startedAt   DateTime            @default(now())
   completedAt DateTime?
 
   market Market? @relation("MarketGenerationJobMarket", fields: [marketId], references: [id])
@@ -175,11 +286,15 @@ model Trade {
   marketId     String
   direction    TradeDirection
   status       TradeStatus    @default(PENDING)
+  /// CHECK: trades_amount_nonneg (amount >= 0)
   amount       Float
   price        Float
   edgeDetected Float
   kellyFraction Float
   txHash       String?
+  /// CHECK: trades_inner_tx_hash_format (innerTxHash IS NULL OR 64 hex chars)
+  /// Inner (pre-fee-bump) hash; txHash is what appears on chain (#38).
+  innerTxHash  String?
   builderFee   Float          @default(0)
   errorMessage String?
   executedAt   DateTime?
@@ -203,91 +318,220 @@ model Position {
   tradeId      String         @unique
   direction    TradeDirection
   status       PositionStatus @default(OPEN)
+  /// CHECK: positions_entry_price_range (entryPrice >= 0 AND entryPrice <= 1)
   entryPrice   Float
+  /// CHECK: positions_current_price_range (currentPrice IS NULL OR (currentPrice >= 0 AND currentPrice <= 1))
   currentPrice Float?
   size         Float
   pnl          Float          @default(0)
+  /// Outcome shares held, from agent_buy's result (i128 base units, #77/#78). Null: legacy row.
+  sharesRaw    Decimal?       @db.Decimal(39, 0)
+  /// Collateral paid for the shares still held (base units). Reduced pro rata by partial exits.
+  costBasisRaw Decimal?       @db.Decimal(39, 0)
+  feesPaidRaw  Decimal?       @db.Decimal(39, 0)
+  /// Collateral received from confirmed exits, and the PnL they realised.
+  realisedCollateralRaw Decimal @default(0) @db.Decimal(39, 0)
+  realisedPnlRaw        Decimal @default(0) @db.Decimal(39, 0)
+  /// Mark to market (#78): mid price of the held outcome, mid value, value if sold now, and the latter minus cost.
+  markPriceBps       Int?
+  markValueRaw       Decimal?  @db.Decimal(39, 0)
+  liquidationValueRaw Decimal? @db.Decimal(39, 0)
+  unrealisedPnlRaw   Decimal?  @db.Decimal(39, 0)
+  markedAt           DateTime? @db.Timestamptz(3)
+  /// indexed | rpc | estimated
+  valuationSource    String?
+  /// The pool could not absorb a sale of all shares, so liquidation value is 0.
+  illiquid           Boolean   @default(false)
   hedgeMarketId String?
   closedAt     DateTime?
   closeReason  String?
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
-  trade  Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  market      Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  hedgeMarket Market? @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
+  trade       Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  exits       PositionExit[]
 
   @@index([marketId])
   @@index([status])
   @@map("positions")
 }
 
+/// One attempt to sell shares of a position through treasury.agent_sell (#77).
+model PositionExit {
+  id               String   @id @default(uuid())
+  positionId       String
+  /// live | dry-run
+  mode             String
+  sharesSoldRaw    Decimal  @default(0) @db.Decimal(39, 0)
+  collateralOutRaw Decimal  @db.Decimal(39, 0)
+  maxSharesInRaw   Decimal  @db.Decimal(39, 0)
+  /// collateralOut / sharesSold, for display.
+  effectivePrice   Float?
+  txHash           String?
+  reason           String
+  /// SUBMITTED | CONFIRMED | FAILED | SIMULATED
+  status           String
+  error            String?
+  createdAt        DateTime @default(now())
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([positionId])
+  @@map("position_exits")
+}
+
+enum AgentControlScope {
+  ALL
+  MARKET_MAKER
+  TRADER
+}
+
+/// Persistent pause / kill switch shared by every backend instance (#79).
+model AgentControl {
+  scope       AgentControlScope @id
+  paused      Boolean           @default(false)
+  reason      String?
+  /// operator | drawdown | chain_paused | failure_breaker
+  source      String?
+  pausedUntil DateTime?
+  /// Wallet address or 'system'.
+  pausedBy    String?
+  version     Int               @default(0)
+  updatedAt   DateTime          @updatedAt
+
+  @@map("agent_controls")
+}
+
+model AgentControlEvent {
+  id        String            @id @default(uuid())
+  scope     AgentControlScope
+  action    String
+  reason    String?
+  source    String
+  actor     String
+  before    Json
+  after     Json
+  createdAt DateTime          @default(now())
+
+  @@index([scope, createdAt])
+  @@map("agent_control_events")
+}
+
 /// Structured AI reasoning trace for every decision
 model ReasoningTrace {
-  id                  String    @id @default(uuid())
+  id                  String            @id @default(uuid())
   marketId            String
   agentType           AgentType
   decisionType        String
-  sourcesUsed         Json      // Array<{ source, weight, signal }>
+  sourcesUsed         Json              // Array<{ source, weight, signal }>
+  /// CHECK: reasoning_traces_prob_est_range (probabilityEstimate >= 0 AND probabilityEstimate <= 1)
   probabilityEstimate Float
+  /// CHECK: reasoning_traces_market_prob_range (marketProbability >= 0 AND marketProbability <= 1)
   marketProbability   Float
   edge                Float
-  confidenceInterval  Json      // { lower: Float, upper: Float }
+  /// CHECK: reasoning_traces_ci_shape (confidenceInterval is object with lower <= upper)
+  confidenceInterval  Json              // { lower: Float, upper: Float }
   betFraction         Float?
   betSizeUsdc         Float?
-  hedgeConditions     Json?     // string[]
+  hedgeConditions     Json?             // string[]
+  /// TraceProvenance embedded in the pinned payload (#66). Null for older traces.
+  provenance          Json?
   agentWallet         String?
   signature           String?
   ipfsCid             String?
+  /// CHECK: reasoning_traces_trace_hash_format (traceHash IS NULL OR 64 hex chars)
   /// sha256 (hex) of the exact bytes pinned to IPFS.
   traceHash           String?
+  /// CHECK: reasoning_traces_onchain_id_nonneg (onChainTraceId IS NULL OR onChainTraceId >= 0)
   /// reasoning-registry u64 trace id.
-  onChainTraceId      BigInt?   @unique
+  onChainTraceId      BigInt?           @unique
+  /// CHECK: reasoning_traces_publish_tx_hash_format (publishTxHash IS NULL OR 64 hex chars)
   publishTxHash       String?
-  verified            Boolean          @default(false)
-  isPublic            Boolean          @default(false)
-  previewSources      Json?            // First 2 sources (free preview)
-  contentMode         TraceContentMode @default(PLAINTEXT_LEGACY)
-  plaintextHash       String?          @db.VarChar(64)
-  createdAt           DateTime         @default(now())
-  updatedAt           DateTime         @updatedAt
+  /// CHECK: reasoning_traces_publish_inner_tx_hash_format (publishInnerTxHash IS NULL OR 64 hex chars)
+  /// Inner (pre-fee-bump) hash of the publish transaction (#38).
+  publishInnerTxHash  String?
+  verified            Boolean           @default(false)
+  isPublic            Boolean           @default(false)
+  previewSources      Json?             // First 2 sources (free preview)
+  lastAuditStatus     TraceAuditStatus?
+  lastAuditedAt       DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
   copyTrades    CopyTrade[]
   subscriptions Subscription[]
-  traceKey      TraceKey?
+  paymentEvents PaymentEvent[]
+  audits        TraceAudit[]
+  publication   TracePublication?
 
   @@index([marketId])
   @@index([ipfsCid])
   @@index([verified])
+  @@index([traceHash])
   @@index([createdAt])
+  @@index([marketId, createdAt])
+  /// Retention (#73) keeps signals cited by a trace: `sourcesUsed @> [{"signalId": …}]`.
+  @@index([sourcesUsed(ops: JsonbPathOps)], type: Gin)
   @@map("reasoning_traces")
+}
+
+/// Daily calibration metrics per slice (#68). Append-only; the API serves the latest computedAt.
+model CalibrationSnapshot {
+  id         String   @id @default(uuid())
+  computedAt DateTime @default(now()) @db.Timestamptz(3)
+  /// '30d' | '90d' | 'all'
+  window     String
+  /// 'agentType' | 'category' | 'decisionType' | 'promptVersion' | 'model' | 'agentType_category'
+  groupBy    String
+  groupKey   String
+  /// brier, logLoss, baseline, buckets, murphy, nMarkets, nTraces, nEff, shrinkageK
+  metrics    Json
+
+  @@index([window, groupBy, computedAt])
+  @@map("calibration_snapshots")
 }
 
 /// A subscriber copying an agent's trade
 model CopyTrade {
-  id         String         @id @default(uuid())
-  userId     String
-  traceId    String
-  marketId   String
-  tradeId    String?
-  direction  TradeDirection
-  amount     Float
-  amountRaw  String?
-  txHash     String?
-  builderFee Float          @default(0)
-  status     TradeStatus    @default(PENDING)
-  pnl        Float?
-  createdAt  DateTime       @default(now())
-  updatedAt  DateTime       @updatedAt
+  id                   String          @id @default(uuid())
+  userId               String
+  traceId              String
+  marketId             String
+  tradeId              String?
+  direction            TradeDirection
+  /// CHECK: copy_trades_amount_nonneg (amount >= 0)
+  amount               Float
+  /// CHECK: copy_trades_amount_raw_digits (amountRaw IS NULL OR digits only)
+  amountRaw            String?
+  /// CHECK: copy_trades_tx_hash_format (txHash IS NULL OR 64 hex chars)
+  txHash               String?         @unique
+  builderFee           Float           @default(0)
+  status               CopyTradeStatus @default(PENDING)
+  pnl                  Float?
+  collateralRaw        String?
+  sharesRaw            String?
+  feeRaw               String?
+  ledger               Int?
+  chainEventId         String?
+  confirmedAt          DateTime?
+  failureCode          String?
+  verificationAttempts Int             @default(0)
+  expiresAt            DateTime?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
 
   user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  trace  ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
-  market Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trace  ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Restrict)
+  market Market         @relation(fields: [marketId], references: [id], onDelete: Restrict)
   trade  Trade?         @relation(fields: [tradeId], references: [id])
 
   @@index([userId])
   @@index([traceId])
   @@index([status])
+  @@index([status, expiresAt])
   @@map("copy_trades")
 }
 
@@ -298,10 +542,22 @@ model Subscription {
   traceId    String?
   type       SubscriptionType
   status     SubscriptionStatus @default(ACTIVE)
+  /// CHECK: subscriptions_amount_paid_nonneg (amountPaid >= 0)
   amountPaid Float
-  currency   String             @default("USDC")
-  txHash     String?
+  currency   SettlementCurrency @default(USDC)
+  /// CHECK: subscriptions_tx_hash_format (txHash IS NULL OR 64 hex chars)
+  txHash     String?            @unique
+  /// Ledger that contained the payment transaction (#54).
+  purchaseLedger Int?
+  /// Ledger-close-anchored coverage window (#54). expiresAt is kept for
+  /// backwards compatibility and always mirrors endsAt for new rows.
+  startsAt   DateTime?
+  endsAt     DateTime?
   expiresAt  DateTime?
+  /// Server-issued intent that settled this subscription (#52).
+  paymentIntentId String?       @unique
+  /// Set when the PASS_EXPIRING socket event was claimed for this pass (#94).
+  expiryNotifiedAt DateTime?
   createdAt  DateTime           @default(now())
   updatedAt  DateTime           @updatedAt
 
@@ -311,7 +567,100 @@ model Subscription {
   @@index([userId])
   @@index([status])
   @@index([expiresAt])
+  @@index([userId, status, endsAt])
   @@map("subscriptions")
+}
+
+/// One admin refund request for one PaymentEvent (#57). The backend never
+/// holds the revenue account's secret key: it only prepares unsigned XDR,
+/// verifies the returned envelope byte-for-byte, submits it and confirms the
+/// on-chain transfer before marking the payment refunded.
+model Refund {
+  id              String             @id @default(uuid())
+  /// Refundable at most once: one refund row per payment event.
+  paymentEventId  String             @unique
+  userId          String
+  /// Original payment amount in 7-decimal base units. CHECK: digits only.
+  amountRaw       String
+  currency        SettlementCurrency @default(USDC)
+  status          RefundStatus       @default(REQUESTED)
+  reason          String
+  rejectionReason String?
+  /// Base64 XDR of the simulated, unsigned SAC transfer.
+  unsignedXdr     String?
+  /// Hash of the exact prepared transaction body; signatures do not change it.
+  preparedHash    String?
+  preparedExpiresAt DateTime?
+  /// Hash of the submitted transaction (unique: one refund per transaction).
+  submittedTxHash String?            @unique
+  ledger          Int?
+  error           String?
+  requestedBy     String
+  approvedBy      String?
+  preparedBy      String?
+  submittedBy     String?
+  requestedAt     DateTime           @default(now())
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  preparedAt      DateTime?
+  submittedAt     DateTime?
+  confirmedAt     DateTime?
+  failedAt        DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentEvent PaymentEvent @relation(fields: [paymentEventId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@index([userId])
+  @@map("refunds")
+}
+
+/// A settlement reported by the x402 facilitator (#61). Inserting the row is
+/// the exactly-once claim for the settlement transaction hash, so a retry can
+/// resume recording a settled payment instead of charging again.
+model X402Settlement {
+  txHash         String             @id
+  userId         String
+  payer          String
+  amountRaw      String
+  currency       SettlementCurrency @default(USDC)
+  network        String
+  asset          String
+  /// RECEIVED | RECORDED | FAILED
+  status         String             @default("RECEIVED")
+  paymentEventId String?            @unique
+  subscriptionId String?
+  attempts       Int                @default(0)
+  lastError      String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status, createdAt])
+  @@map("x402_settlements")
+}
+
+/// Issued trace-entitlement tokens (#62), kept so a refund or revocation can
+/// revoke their jtis in Redis. The token itself carries no PII beyond the
+/// user's public address.
+model EntitlementToken {
+  jti            String    @id
+  userId         String
+  subscriptionId String?
+  traceId        String
+  expiresAt      DateTime
+  issuedAt       DateTime  @default(now())
+  revokedAt      DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+  @@index([expiresAt])
+  @@map("entitlement_tokens")
 }
 
 /// Full audit trail of every agent decision and action
@@ -342,8 +691,75 @@ model SignalCache {
   expiresAt DateTime
 
   @@index([source, expiresAt])
-  // @@index([expiresAt])
   @@map("signal_cache")
+}
+
+/// Normalised evidence with a stable identity (#73). One row per article URL
+/// (or FRED observation), however often it is fetched; syndicated copies share
+/// a clusterId. Trace payloads cite rows by id. Replaces SignalCache, which is
+/// no longer written and is dropped in a follow-up migration.
+model Signal {
+  id                 String          @id @default(uuid())
+  /// NEWSAPI | FRED | GDELT
+  source             String
+  /// sha256 of the canonical URL, or of FRED:<series>:<observation date>.
+  dedupKey           String          @unique
+  externalId         String?
+  url                String?
+  publisher          String?
+  title              String
+  summary            String?
+  publishedAt        DateTime        @db.Timestamptz(3)
+  firstSeenAt        DateTime        @default(now()) @db.Timestamptz(3)
+  lastSeenAt         DateTime        @default(now()) @db.Timestamptz(3)
+  seenCount          Int             @default(1)
+  category           MarketCategory?
+  categoryConfidence Float?
+  /// Id of the oldest signal in this near-duplicate cluster (its own id when it started one).
+  clusterId          String?
+  /// FRED observation value.
+  numericValue       Float?
+  /// 64-bit SimHash of title + summary prefix, signed.
+  simhash            BigInt?
+
+  @@index([publishedAt])
+  @@index([clusterId])
+  @@index([source, lastSeenAt])
+  @@index([category, publishedAt])
+  @@map("signals")
+}
+
+/// One provider call (#73): when, how long, outcome and item counts.
+model SignalFetch {
+  id                 String   @id @default(uuid())
+  source             String
+  /// sha256 of the canonical request with credentials removed.
+  requestFingerprint String
+  startedAt          DateTime @default(now()) @db.Timestamptz(3)
+  durationMs         Int
+  /// ok | error | timeout | skipped_no_key
+  status             String
+  itemCount          Int      @default(0)
+  /// Provider items dropped before storage (no URL, unparseable date, missing value).
+  rejectedCount      Int      @default(0)
+  error              String?
+  rawPayloadId       String?
+
+  @@index([source, startedAt])
+  @@index([startedAt])
+  @@map("signal_fetches")
+}
+
+/// Provider response as received, credentials stripped, kept for
+/// SIGNAL_RAW_RETENTION_DAYS (#73).
+model SignalRawPayload {
+  id        String   @id @default(uuid())
+  source    String
+  payload   Json
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([createdAt])
+  @@map("signal_raw_payloads")
 }
 
 /// Ledger cursor for the Stellar event indexer, one row per network.
@@ -364,53 +780,82 @@ model ChainEvent {
   eventName      String
   ledger         Int
   ledgerClosedAt DateTime
+  /// CHECK: chain_events_tx_hash_format (64 hex chars)
   txHash         String
   /// Decoded event params (bigints as strings).
   params         Json
+  /// True once the event reached the event bus (or has nothing to publish).
+  /// Rows stored before the bus existed are true.
+  published      Boolean  @default(false)
   createdAt      DateTime @default(now())
 
   @@index([contractName, eventName])
   @@index([ledger])
   @@index([txHash])
+  @@index([published, ledger])
   @@map("chain_events")
 }
 
 // Event emitted for every payment transaction related to subscriptions and copy trading
 model PaymentEvent {
-  id            String   @id @default(uuid())
+  id            String             @id @default(uuid())
   userId        String
-  txHash        String   @unique
-  type          String   // DAILY_PASS | PER_TRACE | REFUND
+  /// CHECK: payment_events_tx_hash_format (64 hex chars)
+  txHash        String             @unique
+  type          PaymentEventType
   amount        Float
+  /// CHECK: payment_events_amount_raw_digits (amountRaw IS NULL OR digits only)
   amountRaw     String?
   fromAddress   String?
-  currency      String   @default("USDC")
-  status        String   // PENDING | CONFIRMED | FAILED
+  currency      SettlementCurrency @default(USDC)
+  status        PaymentEventStatus @default(PENDING)
   traceId       String?
+  /// Ledger / close time of the verified transfer (#53/#54).
+  ledger        Int?
+  ledgerCloseTime DateTime?
+  /// Set when the verified amount exceeded the remaining spending approval.
+  allowanceOverage Boolean         @default(false)
+  allowanceOverageRaw Decimal?     @db.Decimal(39, 0)
+  /// Server-issued intent that settled this payment (#52).
+  paymentIntentId String?          @unique
   metadata      Json?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime           @default(now())
   confirmedAt   DateTime?
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reconciled    Boolean            @default(false) // #56 reconciliation flag
+  
+  user  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trace ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
+  refund Refund?
 
   @@index([userId])
-  @@index([txHash])
-  @@map("payment_events")
+
 }
 
 // User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
-  id           String   @id @default(uuid())
-  userId       String   @unique
-  dailyLimit   Float
+  id            String             @id @default(uuid())
+  userId        String             @unique
+  /// CHECK: spending_allowances_daily_limit_nonneg (dailyLimit >= 0)
+  dailyLimit    Float
+  /// CHECK: spending_allowances_per_trace_limit_nonneg (perTraceLimit >= 0)
   perTraceLimit Float
-  spentToday   Float    @default(0)
-  currency     String   @default("USDC")
-  lastResetAt  DateTime @default(now())
-  isActive     Boolean  @default(true)
+  /// CHECK: spending_allowances_spent_today_nonneg (spentToday >= 0)
+  spentToday    Float              @default(0)
+  /// Exact base-unit accounting (#53). The Float columns above are display
+  /// mirrors; limits and spend are never enforced from them.
+  dailyLimitRaw    Decimal          @default(0) @db.Decimal(39, 0)
+  perTraceLimitRaw Decimal          @default(0) @db.Decimal(39, 0)
+  spentTodayRaw    Decimal          @default(0) @db.Decimal(39, 0)
+  /// Amount accepted while already at the limit; never silently discarded.
+  overageRaw       Decimal          @default(0) @db.Decimal(39, 0)
+  /// UTC day the raw counters belong to.
+  windowStartedAt  DateTime         @default(now())
+  currency      SettlementCurrency @default(USDC)
+  lastResetAt   DateTime           @default(now())
+  isActive      Boolean            @default(true)
 
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -418,111 +863,553 @@ model SpendingAllowance {
   @@map("spending_allowances")
 }
 
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
+// ─────────────────────────── PRICING SCHEDULE ───────────────────────────
+model PriceSchedule {
+  id                String   @id @default(cuid())
+  version           Int      @unique
+  dailyPassPriceRaw String   // USDC base‑unit integer stored as string
+  perTracePriceRaw  String   // USDC base‑unit integer stored as string
+  effectiveAt       DateTime // when this version becomes active
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  @@map("price_schedules")
 }
 
-model MarketGenerationRun {
-  id            String             @id @default(uuid())
-  trigger       String             // 'cron' | 'admin' | 'resume'
-  state         GenerationRunState @default(STARTED)
-  attempts      Int                @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  inputs        Json?              // signals snapshot ids, proposal
-  outputs       Json               @default("{}") // { questionCid, questionHash, resolutionHash, chainTxHash, onChainMarketId, traceId, traceCid, traceHash, traceTxHash, onChainTraceId }
-  marketId      String?            @unique
-  lastError     Json?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+/// Exact bytes of IPFS documents the backend pinned or verified (#100).
+model IpfsContent {
+  cid          String    @id
+  /// sha256 hex of `bytes`; the only admission criterion.
+  sha256       String
+  size         Int
+  bytes        Bytes
+  /// PINNED | GATEWAY_VERIFIED
+  origin       String
+  /// e.g. "pin" or "reasoning_registry:trace:12".
+  verifiedBy   String?
+  createdAt    DateTime  @default(now())
+  lastAccessAt DateTime  @default(now())
+  pinnedUntil  DateTime?
 
-  market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
+  @@index([sha256])
+  @@index([lastAccessAt])
+  @@map("ipfs_content")
 }
 
-enum TraceContentMode {
-  PLAINTEXT_LEGACY
-  ENCRYPTED
+/// Unsigned admin transactions prepared by the treasury operations console (#156).
+model AdminOperation {
+  id              String   @id @default(uuid())
+  kind            String
+  params          Json
+  contractId      String
+  sourceAccount   String
+  unsignedXdr     String
+  /// Hash of the prepared transaction body; signatures do not change it.
+  txHash          String   @unique
+  signedXdr       String?
+  signatures      Json     @default("[]")
+  weightCollected Int      @default(0)
+  /// PREPARED | PARTIALLY_SIGNED | READY | SUBMITTED | SUCCESS | FAILED | EXPIRED | CANCELLED
+  status          String
+  resultXdr       String?
+  ledger          Int?
+  error           Json?
+  requestedBy     String
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@map("admin_operations")
 }
 
-model TraceKey {
-  traceId       String   @id
-  kid           String
-  wrappedKey    Bytes
-  plaintextHash String   @db.VarChar(64)
-  createdAt     DateTime @default(now())
+/// On-chain transparency reports published by the daily job (#159).
+model TransparencyReport {
+  id             String   @id @default(uuid())
+  /// UTC day, YYYY-MM-DD.
+  date           String   @unique
+  anchorLedger   Int
+  cid            String
+  hash           String
+  onChainTraceId BigInt?
+  mode           String
+  /// exact | best_effort
+  consistency    String
+  report         Json
+  createdAt      DateTime @default(now())
+
+  @@index([anchorLedger])
+  @@map("transparency_reports")
+}
+
+/// Immutable reasoning-registry traces, cached so report counts do not walk
+/// the whole registry on every run (#159).
+model RegistryTraceCache {
+  traceId     BigInt   @id
+  agent       String
+  marketId    BigInt
+  action      String
+  traceHash   String
+  ipfsCid     String
+  publishedAt BigInt
+  fetchedAt   DateTime @default(now())
+
+  @@index([agent, action])
+  @@map("registry_trace_cache")
+}
+
+/// Runs of the reasoning trace auditor
+model TraceAuditRun {
+  id            String    @id @default(uuid())
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+  cursorTraceId BigInt?
+  stats         Json?
+
+  @@map("trace_audit_runs")
+}
+
+/// Audit findings per on-chain / DB trace
+model TraceAudit {
+  id              String           @id @default(uuid())
+  onChainTraceId  BigInt?
+  traceId         String?
+  onChainMarketId BigInt?
+  agent           String?
+  action          String?
+  ipfsCid         String?
+  onChainHash     String?
+  computedHash    String?
+  status          TraceAuditStatus
+  detail          Json?
+  runId           String
+  checkedAt       DateTime         @default(now())
+
+  trace ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
+
+  @@unique([onChainTraceId, runId])
+  @@index([status, checkedAt])
+  @@index([traceId, checkedAt])
+  @@map("trace_audits")
+}
+
+/// Rows violating constraints quarantined before repair
+model ConstraintQuarantine {
+  id        String   @id @default(uuid())
+  tableName String   @map("table_name")
+  rowId     String   @map("row_id")
+  checkName String   @map("check_name")
+  row       Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tableName, checkName])
+  @@map("constraint_quarantine")
+}
+
+/// Lifecycle of a reasoning trace's on-chain publication (#131).
+enum TracePublicationStatus {
+  AWAITING_PIN
+  AWAITING_MARKET
+  READY
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+/// Durable queue row: one per trace that should be published to
+/// reasoning-registry. Processed by src/jobs/trace-publication.worker.ts.
+model TracePublication {
+  id               String                 @id @default(uuid())
+  traceId          String                 @unique
+  action           String
+  /// Exact trace document; pinned bytes = canonicalBytes(payload). Null only
+  /// for backfilled rows whose trace was already pinned.
+  payload          Json?
+  status           TracePublicationStatus @default(AWAITING_PIN)
+  attempts         Int                    @default(0)
+  lastError        String?
+  nextAttemptAt    DateTime               @default(now())
+  submittedTxHash  String?
+  /// Trace id returned by the publish_trace write, used to re-check chain state.
+  submittedTraceId BigInt?
+  confirmedAt      DateTime?
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
 
   trace ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
 
-  @@map("trace_keys")
+  @@index([status, nextAttemptAt])
+  @@map("trace_publications")
 }
 
-model WalletPosition {
-  wallet           String
-  onChainMarketId  BigInt
-  outcome          String     // 'Yes' | 'No'
-  shares           Decimal    @default(0) @db.Decimal(39, 0)
-  costBasis        Decimal    @default(0) @db.Decimal(39, 0)
-  realizedPnl      Decimal    @default(0) @db.Decimal(39, 0)
-  boughtCollateral Decimal    @default(0) @db.Decimal(39, 0)
-  soldCollateral   Decimal    @default(0) @db.Decimal(39, 0)
-  feesPaid         Decimal    @default(0) @db.Decimal(39, 0)
-  redeemed         Decimal    @default(0) @db.Decimal(39, 0)
-  tradeCount       Int        @default(0)
-  lastEventId      String     @default("")
-  settled          Boolean    @default(false)
-  incomplete       Boolean    @default(false)
-  updatedAt        DateTime   @updatedAt
+/// Idempotency-Key records for state-changing endpoints (#123). One row per
+/// (scope, method, route, key); see src/middlewares/idempotency.middleware.ts.
+model IdempotencyKey {
+  id              String   @id @default(uuid())
+  /// userId, or "anon" for unauthenticated routes
+  scope           String
+  method          String
+  /// Route template, e.g. "/api/v1/trade/copy"
+  route           String
+  key             String
+  /// sha256 of the canonical request (method, route, params, query, body)
+  fingerprint     String
+  /// IN_PROGRESS | COMPLETED
+  status          String
+  lockedUntil     DateTime
+  responseCode    Int?
+  responseBody    Json?
+  responseHeaders Json?
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
 
-  @@id([wallet, onChainMarketId, outcome])
+  @@unique([scope, method, route, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+
+/// Empirical pairwise market correlations, recomputed on a schedule (#80).
+model CorrelationSnapshot {
+  id           String   @id @default(uuid())
+  computedAt   DateTime @default(now()) @db.Timestamptz(3)
+  gridStepSecs Int
+  windowDays   Int
+  /// [{ a, b, rho, n, method: 'empirical'|'prior', sample, prior, delta }], backend market ids with a < b.
+  pairs        Json
+
+  @@index([computedAt])
+  @@map("correlation_snapshots")
+}
+
+/// One drift finding from the market lifecycle reconciler (#83).
+model MarketDriftReport {
+  id              String   @id @default(uuid())
+  runId           String
+  marketId        String
+  onChainMarketId BigInt
+  driftClass      String
+  dbValue         Json
+  chainValue      Json
+  /// REPAIRED | REPORTED | DEFERRED | SKIPPED_NEWER
+  action          String
+  observedLedger  Int
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([runId])
+  @@index([driftClass, createdAt])
+  @@map("market_drift_reports")
+}
+
+model ReconcileRun {
+  id         String    @id @default(uuid())
+  startedAt  DateTime  @default(now()) @db.Timestamptz(3)
+  finishedAt DateTime?           @db.Timestamptz(3)
+  scanned    Int       @default(0)
+  repaired   Int       @default(0)
+  reported   Int       @default(0)
+  deferred   Int       @default(0)
+  rpcCalls   Int       @default(0)
+  error      String?
+
+  @@map("reconcile_runs")
+}
+
+/// Transaction outbox: every live write persists its signed inner envelope here
+/// before submission, and a recovery worker polls and fee-bumps stuck rows
+/// (#38). The inner `hash` is the identity; fee-bump envelopes are extra.
+/// Outbox state machine (#35): BUILT → SIGNED → SUBMITTED → PENDING →
+/// SUCCESS | FAILED | EXPIRED. PENDING means submitted and handed to the
+/// recovery worker after the inline wait expired.
+enum ChainTxStatus {
+  BUILT
+  SIGNED
+  SUBMITTED
+  PENDING
+  SUCCESS
+  FAILED
+  EXPIRED
+}
+
+/// Transactional outbox (#35, #38): every live write persists its signed
+/// inner envelope and hash before submission, a recovery worker resolves
+/// non-terminal rows after a crash, and the fee-bump pass wraps stuck rows.
+model ChainTransaction {
+  id String @id @default(uuid())
+  /// Completion-handler key: market.create | trade.buy | trade.sell | trace.publish | <contract>.<method>.
+  kind   String
+  /// Domain row the write belongs to (Market.id | Trade.id | PositionExit.id | ReasoningTrace.id).
+  refId  String?
+  contract String?
+  method   String?
+  args     Json?
+  simulated Json?
+  /// Transaction source account (agent or leased channel).
+  source   String?
+  sequence String?
+  /// Inner transaction hash (hex). The outbox identity and dedup key.
+  hash   String? @unique
+  /// Signed inner envelope (base64 XDR), wrapped unchanged by a fee bump.
+  envelopeXdr String?
+  status      ChainTxStatus @default(BUILT)
+  submitLedger Int?
+  /// Timebounds (unix seconds); a bump cannot extend maxTime.
+  minTime      BigInt?
+  maxTime      BigInt?
+  /// Ledger the transaction landed in.
+  ledger       Int?
+  resultXdr    String?
+  /// Native return value (printable form) once the write landed.
+  returnValue  Json?
+  innerFee     String?
+  resourceFee  String?
+  /// Outer (fee-bump) hashes, in submission order.
+  feeBumpHashes String[] @default([])
+  /// Array of { hash, fee, xdr, at } for each bump built.
+  feeBumpEnvelopes Json?
+  /// The hash that actually executed on chain (outer when bumped).
+  landedHash   String?
+  bumpAttempts Int @default(0)
+  attempts     Int @default(0)
+  error        String?
+  /// When the completion handler ran for a terminal status.
+  handledAt    DateTime? @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([status, updatedAt])
+  @@index([landedHash])
+  @@index([kind, refId])
+  @@index([feeBumpHashes], type: Gin)
+  @@map("chain_transactions")
+}
+
+/// On-chain fees recorded per transaction (#39).
+model ChainFee {
+  txHash       String   @id @map("tx_hash")
+  opClass      String   @map("op_class")
+  inclusionFee BigInt   @map("inclusion_fee")
+  resourceFee  BigInt   @map("resource_fee")
+  totalFee     BigInt   @map("total_fee")
+  feeCharged   BigInt?  @map("fee_charged")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([opClass, createdAt])
+  @@map("chain_fees")
+}
+
+/// On-chain transaction submissions and lifetime tracking (#42).
+model ChainSubmission {
+  txHash               String   @id @map("tx_hash")
+  opClass              String   @map("op_class")
+  minTime              BigInt   @default(0) @map("min_time")
+  maxTime              BigInt   @map("max_time")
+  authExpirationLedger Int?     @map("auth_expiration_ledger")
+  submittedLedger      Int?     @map("submitted_ledger")
+  submittedAtCloseTime BigInt?  @map("submitted_at_close_time")
+  decision             String   @map("decision")
+  rebuildCount         Int      @default(0) @map("rebuild_count")
+  attemptId            String?  @map("attempt_id")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@index([opClass, createdAt])
+  @@index([attemptId])
+  @@map("chain_submissions")
+}
+
+/// Idempotent market creation attempts (#41).
+model MarketCreationAttempt {
+  id                        String    @id @default(uuid())
+  marketId                  String    @unique @map("market_id")
+  market                    Market    @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  status                    String    @map("status") // CLAIMED, SUBMITTED, LANDED, UNKNOWN, EXPIRED
+  attempts                  Int       @default(0) @map("attempts")
+  claimedAt                 DateTime? @map("claimed_at")
+  claimLeaseExpiresAt       DateTime? @map("claim_lease_expires_at")
+  questionHash              String?   @map("question_hash")
+  resolutionHash            String?   @map("resolution_hash")
+  preSubmissionMarketCount  BigInt?   @map("pre_submission_market_count")
+  postSubmissionMarketCount BigInt?   @map("post_submission_market_count")
+  txHash                    String?   @map("tx_hash")
+  onChainMarketId           BigInt?   @map("on_chain_market_id")
+  createdAt                 DateTime  @default(now()) @map("created_at")
+  updatedAt                 DateTime  @updatedAt @map("updated_at")
+
+  @@index([questionHash])
+  @@index([status, claimedAt])
+  @@map("market_creation_attempts")
+}
+
+/// Database-backed admin RBAC (#49). Roles are fixed values seeded on first
+/// boot; assignments are the source of truth after that. JWT claims never
+/// carry permissions.
+model AdminPermission {
+  key         String   @id
+  description String?
+  createdAt   DateTime @default(now())
+  roles       AdminRolePermission[]
+  @@map("admin_permissions")
+}
+
+model AdminRole {
+  name        String   @id
+  description String?
+  createdAt   DateTime @default(now())
+  permissions AdminRolePermission[]
+  assignments AdminRoleAssignment[]
+  @@map("admin_roles")
+}
+
+model AdminRolePermission {
+  roleName      String
+  permissionKey String
+  role          AdminRole       @relation(fields: [roleName], references: [name], onDelete: Cascade)
+  permission    AdminPermission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+  createdAt     DateTime        @default(now())
+
+  @@id([roleName, permissionKey])
+  @@index([permissionKey])
+  @@map("admin_role_permissions")
+}
+
+model AdminRoleAssignment {
+  id            String   @id @default(uuid())
+  walletAddress String   @unique
+  roleName      String
+  assignedBy    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  role          AdminRole @relation(fields: [roleName], references: [name], onDelete: Restrict)
+
+  @@index([roleName])
+  @@map("admin_role_assignments")
+}
+
+/// Append-only audit trail for admin actions (#49). The migration adds a
+/// trigger that rejects UPDATE and DELETE.
+model AdminAuditLog {
+  id         String   @id @default(uuid())
+  actor      String
+  action     String
+  target     String?
+  roleName   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actor, createdAt])
+  @@index([target])
+  @@map("admin_audit_logs")
+}
+
+/// A server-issued payment intent (#52): the server fixes the amount, memo,
+/// recipient and expiry so a pending transaction can be confirmed without the
+/// client resubmitting arbitrary details.
+model PaymentIntent {
+  id              String              @id @default(uuid())
+  userId          String
+  /// Base account that must be the verified sender.
+  walletAddress   String
+  status          PaymentIntentStatus @default(OPEN)
+  type            SubscriptionType    @default(DAILY_PASS)
+  amountRaw       Decimal             @db.Decimal(39, 0)
+  currency        SettlementCurrency  @default(USDC)
+  recipient       String
+  token           String
+  memo            String              @unique
+  nonce           String              @unique
+  txHash          String?             @unique
+  subscriptionId  String?             @unique
+  paymentEventId  String?             @unique
+  overpaymentRaw  Decimal?            @db.Decimal(39, 0)
+  underpaymentRaw Decimal?            @db.Decimal(39, 0)
+  latePayment     Boolean             @default(false)
+  refundRequired  Boolean             @default(false)
+  attempts        Int                 @default(0)
+  nextAttemptAt   DateTime?
+  expiresAt       DateTime
+  submittedAt     DateTime?
+  confirmedAt     DateTime?
+  expiredAt       DateTime?
+  failureCode     String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([userId, status])
+  @@index([status, nextAttemptAt])
+  @@index([expiresAt])
+  @@map("payment_intents")
+}
+
+/// External resolution signer attestations coordinated through the signer API (#91).
+/// `status`: PREPARED | SUBMITTED | CONFIRMED | FAILED.
+model SignerAttestation {
+  id              String   @id @default(uuid())
+  marketId        String
+  onChainMarketId BigInt
+  signer          String
+  /// YES | NO
+  outcome         String
+  status          String
+  preparedXdr     String
+  /// Hash of the prepared envelope (network-bound); signatures do not change it.
+  preparedHash    String
+  validUntil      DateTime
+  txHash          String?
+  ledger          Int?
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([onChainMarketId, signer, outcome])
+  @@index([marketId])
+  @@map("signer_attestations")
+}
+
+/// Independent review of one ResolutionProposed event (#92).
+/// `verdict`: PENDING | AGREE | DISAGREE | INSUFFICIENT | ERROR.
+model DisputeReview {
+  id                 String    @id @default(uuid())
+  onChainMarketId    BigInt
+  /// chain_events.id of the ResolutionProposed event (or `missed:<market>` for the polling fallback).
+  proposalEventId    String    @unique
+  proposedOutcome    String
+  /// Ledger seconds. Null when the proposal was found by polling and its time is unknown.
+  proposedAt         BigInt?
+  windowEndsAt       BigInt?
+  verdict            String
+  independentOutcome String?
+  confidence         Float?
+  evidence           Json?
+  evidenceHash       String?
+  acknowledgedBy     String?
+  acknowledgedAt     DateTime?
+  /// FINALIZED | CANCELLED | null
+  resolvedAs         String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([verdict])
   @@index([onChainMarketId])
-  @@map("wallet_positions")
+  @@map("dispute_reviews")
 }
 
-model WalletStatsDaily {
-  wallet      String
-  day         DateTime @db.Date
-  category    String
-  volume      Decimal  @default(0) @db.Decimal(39, 0)
-  realizedPnl Decimal  @default(0) @db.Decimal(39, 0)
-  fees        Decimal  @default(0) @db.Decimal(39, 0)
-  trades      Int      @default(0)
-  wins        Int      @default(0)
-  losses      Int      @default(0)
+/// One alert sent (or attempted) for a review, deduplicated by `dedupeKey`.
+model AlertDelivery {
+  id        String    @id @default(uuid())
+  reviewId  String
+  /// INFO | WARN | CRITICAL
+  level     String
+  sink      String
+  /// reviewId:level:sink
+  dedupeKey String    @unique
+  /// SENT | FAILED
+  status    String
+  attempts  Int       @default(0)
+  sentAt    DateTime?
+  error     String?
 
-  @@id([wallet, day, category])
-  @@index([day])
-  @@map("wallet_stats_daily")
+  @@index([reviewId])
+  @@map("alert_deliveries")
 }
-
-model WalletEventApplied {
-  eventId   String   @id
-  appliedAt DateTime @default(now())
-
-  @@map("wallet_events_applied")
-}
-
-model WalletPnlDirtyMarket {
-  onChainMarketId BigInt   @id
-  dirtiedAt       DateTime @default(now())
-  reason          String?
-
-  @@map("wallet_pnl_dirty_markets")
-}
-

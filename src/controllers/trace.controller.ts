@@ -4,16 +4,32 @@ import { z } from 'zod';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
+import { summarizeProvenance } from '../lib/llm/provenance';
 import { verifyTraceOnChain } from '../services/trace-publish.service';
 import { unwrapKey } from '../services/trace-crypto.service';
 import {
-  checkAccess,
+  DAILY_PASS_PRICE_RAW,
   getTracWithAccessControl,
   getSpendingAllowance,
   listPaymentEvents,
+  preauthorizeSpending,
   recordPayment,
   upsertSpendingAllowance,
 } from '../services/subscription.service';
+import {
+  createPaymentIntent,
+  getPaymentIntent,
+  submitPaymentIntent,
+} from '../services/payment-intent.service';
+
+const preauthorizeSchema = z.object({
+  type: z.enum(['PER_TRACE', 'DAILY_PASS']).default('DAILY_PASS'),
+  amountRaw: z.string().regex(/^\d+$/, 'must be an integer in 7-decimal base units').optional(),
+});
+
+const intentSubmitSchema = z.object({
+  txHash: z.string().regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex transaction hash'),
+});
 
 const unlockSchema = z.object({
   txHash:    z.string().regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex transaction hash'),
@@ -62,6 +78,9 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
         onChainTraceId:      true,
         publishTxHash:       true,
         previewSources:      true,
+        provenance:          true,
+        lastAuditStatus:     true,
+        lastAuditedAt:       true,
         createdAt:           true,
         market: { select: { question: true, category: true, settlementCurrency: true, onChainMarketId: true } },
       },
@@ -69,7 +88,13 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
     prisma.reasoningTrace.count({ where }),
   ]);
 
-  sendSuccess(res, traces, 200, buildPaginationMeta(page, limit, total) as any);
+  const formattedTraces = traces.map(({ provenance, ...t }) => ({
+    ...t,
+    provenance: { summary: summarizeProvenance(provenance) },
+    audit: t.lastAuditStatus ? { status: t.lastAuditStatus, checkedAt: t.lastAuditedAt } : null,
+  }));
+
+  sendSuccess(res, formattedTraces, 200, buildPaginationMeta(page, limit, total) as any);
 }
 
 /**
@@ -132,6 +157,8 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
     traceId:       undefined,
     type:          parsed.data.type,
     txHash:        parsed.data.txHash,
+    subId:         req.user.subId ?? null,
+    subIdKind:     req.user.subIdKind ?? null,
   });
 
   const trace = await getTracWithAccessControl(traceId, req.user.userId).catch(() => null);
@@ -144,9 +171,11 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
     return;
   }
 
-  const { dailyLimit, perTraceLimit, currency } = req.body as {
+  const { dailyLimit, perTraceLimit, dailyLimitRaw, perTraceLimitRaw, currency } = req.body as {
     dailyLimit?: number;
     perTraceLimit?: number;
+    dailyLimitRaw?: string;
+    perTraceLimitRaw?: string;
     currency?: string;
   };
 
@@ -154,11 +183,29 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
     sendError(res, 400, 'MISSING_ALLOWANCE_FIELDS', 'dailyLimit and perTraceLimit are required numbers');
     return;
   }
+  if (
+    (dailyLimitRaw !== undefined && !/^\d+$/.test(dailyLimitRaw)) ||
+    (perTraceLimitRaw !== undefined && !/^\d+$/.test(perTraceLimitRaw))
+  ) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'dailyLimitRaw and perTraceLimitRaw must be integer base-unit strings');
+    return;
+  }
 
-  // Ensure the user record exists before creating the FK-linked spending allowance
+  // Ensure the user record exists before creating the FK-linked spending
+  // allowance. Key on the user id: walletAddress is no longer unique (#46),
+  // several sub-users share one pooled base account.
+  const identityKey = req.user.subId != null
+    ? `${req.user.walletAddress}#${req.user.subIdKind === 'MUXED' ? 'muxed' : 'memo'}:${req.user.subId}`
+    : req.user.walletAddress;
   await prisma.user.upsert({
-    where:  { walletAddress: req.user.walletAddress },
-    create: { id: req.user.userId, walletAddress: req.user.walletAddress },
+    where:  { id: req.user.userId },
+    create: {
+      id:            req.user.userId,
+      walletAddress: req.user.walletAddress,
+      subId:         req.user.subId ?? null,
+      subIdKind:     req.user.subIdKind ?? null,
+      identityKey,
+    },
     update: {},
   });
 
@@ -166,6 +213,8 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
     userId: req.user.userId,
     dailyLimit,
     perTraceLimit,
+    dailyLimitRaw,
+    perTraceLimitRaw,
     currency,
   });
 
@@ -191,125 +240,73 @@ export async function getMyPaymentEvents(req: Request, res: Response): Promise<v
   const payments = await listPaymentEvents(req.user.userId);
   sendSuccess(res, payments);
 }
-
-const usedNonces = new Set<string>();
-
 /**
- * GET /traces/:id/key
- * Returns decryption key for entitled users (daily pass / subscription).
+ * POST /traces/access/preauthorize
+ * Advisory-only check against the user's exact spending approval (#53). It
+ * never reserves budget or writes; the payment can still be accepted with an
+ * overage flag, but the client should warn before asking the wallet to sign.
  */
-export async function getTraceKey(req: Request, res: Response): Promise<void> {
+export async function preauthorizeAccess(req: Request, res: Response): Promise<void> {
   if (!req.user) {
     sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
     return;
   }
-
-  const traceId = String(req.params.id);
-  const access = await checkAccess(req.user.userId, traceId);
-  if (!access.hasAccess) {
-    sendError(res, 403, 'FORBIDDEN', 'Active pass or subscription required to access trace key');
+  const parsed = preauthorizeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'Invalid preauthorization request', parsed.error.flatten().fieldErrors as any);
     return;
   }
-
-  const traceKey = await prisma.traceKey.findUnique({
-    where: { traceId },
-  });
-
-  if (!traceKey) {
-    sendError(res, 404, 'TRACE_KEY_NOT_FOUND', 'No encryption key found for this trace');
+  const amountRaw = parsed.data.amountRaw
+    ? BigInt(parsed.data.amountRaw)
+    : parsed.data.type === 'DAILY_PASS'
+      ? DAILY_PASS_PRICE_RAW
+      : null;
+  if (amountRaw == null || amountRaw <= 0n) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'amountRaw is required for PER_TRACE preauthorization');
     return;
   }
+  const decision = await preauthorizeSpending(req.user.userId, parsed.data.type, amountRaw);
+  sendSuccess(res, { type: parsed.data.type, amountRaw: amountRaw.toString(), ...decision });
+}
 
-  const dataKey = unwrapKey(traceKey.wrappedKey, traceKey.kid);
+/** POST /traces/payment-intents — issue a server-priced daily-pass intent (#52). */
+export async function createIntent(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+  const created = await createPaymentIntent(req.user.userId, req.user.walletAddress);
+  sendSuccess(res, created, 201);
+}
 
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'SUBSCRIPTION',
-      action: 'TRACE_KEY_RELEASED',
-      details: { traceId, userId: req.user.userId, kid: traceKey.kid },
-    },
-  });
-
-  sendSuccess(res, {
-    kid: traceKey.kid,
-    dataKey: dataKey.toString('base64'),
-    plaintextHash: traceKey.plaintextHash,
-  });
+/** GET /traces/payment-intents/:id — the caller's own intent. */
+export async function getIntent(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+  sendSuccess(res, await getPaymentIntent(req.user.userId, String(req.params.id)));
 }
 
 /**
- * POST /internal/traces/:onChainTraceId/key
- * Secure x402 trace key release with shared HMAC and replay protection.
+ * POST /traces/payment-intents/:id/submit — attach a tx hash and settle or
+ * move the intent to PENDING_PAYMENT. Safe to call again.
  */
-export async function releaseTraceKeyInternal(req: Request, res: Response): Promise<void> {
-  const secret = config.X402_KEY_RELEASE_SECRET;
-  if (!secret) {
-    sendError(res, 503, 'FEATURE_DISABLED', 'Internal key release is not configured');
+export async function submitIntent(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
     return;
   }
-
-  const signature = req.headers['x-signature'] as string;
-  const timestamp = req.headers['x-timestamp'] as string;
-  const nonce = req.headers['x-nonce'] as string;
-
-  if (!signature || !timestamp || !nonce) {
-    sendError(res, 401, 'UNAUTHORIZED', 'Missing authentication headers (x-signature, x-timestamp, x-nonce required)');
+  const parsed = intentSubmitSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'txHash is required', parsed.error.flatten().fieldErrors as any);
     return;
   }
-
-  const now = Math.floor(Date.now() / 1000);
-  const ts = parseInt(timestamp, 10);
-  if (isNaN(ts) || Math.abs(now - ts) > 300) {
-    sendError(res, 401, 'EXPIRED_REQUEST', 'Request timestamp is outside the allowed window');
-    return;
-  }
-
-  if (usedNonces.has(nonce)) {
-    sendError(res, 401, 'REPLAYED_NONCE', 'Nonce has already been used');
-    return;
-  }
-  usedNonces.add(nonce);
-  if (usedNonces.size > 10000) {
-    usedNonces.clear();
-  }
-
-  const onChainTraceId = String(req.params.onChainTraceId);
-  const expectedSig = crypto
-    .createHmac('sha256', secret)
-    .update(`${timestamp}:${nonce}:${onChainTraceId}`)
-    .digest('hex');
-
-  if (signature.toLowerCase() !== expectedSig.toLowerCase()) {
-    sendError(res, 401, 'INVALID_SIGNATURE', 'HMAC signature verification failed');
-    return;
-  }
-
-  let onChainBigInt: bigint;
-  try {
-    onChainBigInt = BigInt(onChainTraceId);
-  } catch {
-    sendError(res, 400, 'INVALID_TRACE_ID', 'Invalid onChainTraceId format');
-    return;
-  }
-
-  const trace = await prisma.reasoningTrace.findFirst({
-    where: { onChainTraceId: onChainBigInt },
-    include: { traceKeys: true },
+  const result = await submitPaymentIntent({
+    userId: req.user.userId,
+    walletAddress: req.user.walletAddress,
+    id: String(req.params.id),
+    txHash: parsed.data.txHash,
   });
-
-  if (!trace || !trace.traceKeys) {
-    sendError(res, 404, 'TRACE_NOT_FOUND', 'Trace or encryption key not found');
-    return;
-  }
-
-  const traceKey = trace.traceKeys;
-  const dataKey = unwrapKey(traceKey.wrappedKey, traceKey.kid);
-
-  sendSuccess(res, {
-    onChainTraceId,
-    traceId: trace.id,
-    kid: traceKey.kid,
-    dataKey: dataKey.toString('base64'),
-    plaintextHash: traceKey.plaintextHash,
-  });
+  sendSuccess(res, result, result.status === 'CONFIRMED' ? 201 : 202);
 }

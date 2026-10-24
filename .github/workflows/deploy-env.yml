@@ -1,0 +1,80 @@
+name: Deploy environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      digest:
+        required: true
+        type: string
+      values_file:
+        required: true
+        type: string
+    secrets:
+      KUBECONFIG:
+        required: true
+      DATABASE_URL:
+        required: true
+      HELM_VALUES:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - uses: azure/setup-helm@v4
+      - name: kubeconfig
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Verify image signature
+        uses: sigstore/cosign-installer@v3
+      - run: cosign verify "${{ inputs.image }}" --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/cd.yml@refs/heads/main" --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Migration lint (changed migrations only)
+        run: |
+          changed="$(git diff --name-only HEAD^ HEAD -- prisma/migrations || true)"
+          if [[ -n "$changed" ]]; then
+            printf '%s\n' "$changed" | xargs node scripts/check-migration-compat.mjs
+          else
+            echo "No migration files changed in this release"
+          fi
+      - name: Apply migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npx prisma migrate deploy
+      - name: Helm upgrade
+        env:
+          HELM_VALUES: ${{ secrets.HELM_VALUES }}
+          NAMESPACE: ${{ inputs.namespace }}
+          IMAGE: ${{ inputs.image }}
+          VALUES_FILE: ${{ inputs.values_file }}
+        run: |
+          test -d deploy/helm/oracledesk-backend || { echo "Helm chart missing (deploy/helm/oracledesk-backend)"; exit 1; }
+          extra=()
+          if [[ -n "$HELM_VALUES" ]]; then printf '%s' "$HELM_VALUES" > "$RUNNER_TEMP/values-secret.yaml"; extra=(-f "$RUNNER_TEMP/values-secret.yaml"); fi
+          helm upgrade --install oracledesk deploy/helm/oracledesk-backend \
+            --namespace "$NAMESPACE" --create-namespace \
+            -f "deploy/helm/oracledesk-backend/$VALUES_FILE" "${extra[@]}" \
+            --set image.repository="${IMAGE%@*}" --set image.digest="${IMAGE#*@}" \
+            --atomic --timeout 10m

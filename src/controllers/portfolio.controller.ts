@@ -3,28 +3,47 @@ import { prisma } from '../lib/prisma';
 import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { getPortfolioSummary } from '../services/portfolio.service';
 import { getPortfolioCorrelations } from '../services/correlation.service';
-import { treasuryAvailableCapital } from '../services/chain.service';
+import { treasuryAvailableCapitalCached } from '../services/chain.service';
+import { readTreasuryBudget } from '../services/treasury-budget.service';
+import { toDisplayUsdc } from '../lib/amounts';
 import { logger } from '../lib/logger';
 
 /**
  * GET /portfolio
  * Returns the agent's portfolio summary:
  *   totalUsdc, deployedCapital, availableCapital,
- *   openPositions count, totalPnl, dailyPnl, builderFeesEarned
+ *   openPositions count, totalPnl, dailyPnl, builderFeesEarned,
+ *   treasury (on-chain capital and caps, #76)
  */
 export async function getPortfolio(req: Request, res: Response): Promise<void> {
-  const [summary, correlations, availableCapitalRaw] = await Promise.all([
-    getPortfolioSummary(),
-    getPortfolioCorrelations(10_000),
-    treasuryAvailableCapital()
-      .then((v) => v.toString())
+  // One read of available_capital, get_config and daily_usage (#76). A failed
+  // read leaves the DB fields and reports treasury: null.
+  const budget = await readTreasuryBudget().catch((err) => {
+    logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury budget read failed');
+    return null;
+  });
+  const [summary, correlations, capRes] = await Promise.all([
+    getPortfolioSummary(budget),
+    getPortfolioCorrelations(budget ? toDisplayUsdc(budget.availableRaw) : null),
+    treasuryAvailableCapitalCached(req.signal)
+      .then((r) => ({ raw: r.value.toString(), ledger: r.ledger }))
       .catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury.available_capital read failed');
-        return null;
+        return { raw: null, ledger: null };
       }),
   ]);
+  const availableCapitalRaw = capRes.raw ?? budget?.availableRaw.toString() ?? null;
 
-  sendSuccess(res, { ...summary, correlationRisk: correlations, availableCapitalRaw });
+  const latestReport = await prisma.transparencyReport
+    .findFirst({ orderBy: { date: 'desc' }, select: { date: true, anchorLedger: true, cid: true, hash: true, onChainTraceId: true, mode: true, consistency: true } })
+    .catch(() => null);
+  sendSuccess(res, {
+    ...summary,
+    correlationRisk: correlations,
+    availableCapitalRaw,
+    availableCapitalLedger: capRes.ledger,
+    latestReport,
+  });
 }
 
 /**
@@ -51,12 +70,21 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
         trade: {
           select: { direction: true, amount: true, edgeDetected: true, kellyFraction: true, txHash: true },
         },
+        exits: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { id: true, status: true, reason: true, mode: true, sharesSoldRaw: true, collateralOutRaw: true, effectivePrice: true, txHash: true, error: true, createdAt: true },
+        },
       },
     }),
     prisma.position.count({ where }),
   ]);
 
-  sendSuccess(res, positions, 200, buildPaginationMeta(page, limit, total) as any);
+  // Raw columns are NUMERIC(39,0) and serialise as decimal strings. markValueRaw
+  // is the mid-price value, liquidationValueRaw what selling now returns; risk
+  // controls use the latter.
+  const rows = positions.map(({ exits, ...position }) => ({ ...position, lastExit: exits[0] ?? null }));
+  sendSuccess(res, rows, 200, buildPaginationMeta(page, limit, total) as any);
 }
 
 /**
@@ -65,17 +93,22 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
  * endpoint, commit 207464d, padded them with constants; this one doesn't.)
  */
 export async function getPlatformStats(_req: Request, res: Response): Promise<void> {
-  const [subscriberCount, copyVolume, marketCount, onChainMarketCount, traceCount] = await Promise.all([
+  const [subscriberCount, copyVolume, rawSumResult, marketCount, onChainMarketCount, traceCount] = await Promise.all([
     prisma.user.count(),
     prisma.copyTrade.aggregate({ _sum: { amount: true }, where: { status: 'EXECUTED' } }),
+    prisma.$queryRawUnsafe<Array<{ sum: string | null }>>(
+      `SELECT COALESCE(SUM("collateralRaw"::numeric), 0)::text as sum FROM copy_trades WHERE status = 'EXECUTED' AND "collateralRaw" IS NOT NULL`
+    ).catch(() => [{ sum: '0' }]),
     prisma.market.count(),
     prisma.market.count({ where: { onChainMarketId: { not: null } } }),
     prisma.reasoningTrace.count(),
   ]);
   const totalCopyVolume = copyVolume._sum.amount ?? 0;
+  const totalCopyVolumeRaw = rawSumResult[0]?.sum ?? '0';
   sendSuccess(res, {
     subscriberCount,
     totalCopyVolume,
+    totalCopyVolumeRaw,
     builderFees: 0,
     marketCount,
     onChainMarketCount,

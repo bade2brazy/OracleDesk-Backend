@@ -1,5 +1,8 @@
 import type { Response } from 'express';
+import { currentContext } from '../lib/context';
 import type { ApiResponse, ApiError, PaginationMeta } from '../types';
+import { canonicalJson, sha256Hex } from './hash.util';
+import { checkETagMatch } from '../middlewares/cache.middleware';
 
 /**
  * Send a successful 2xx response
@@ -11,6 +14,23 @@ export function sendSuccess<T>(
   meta?: Record<string, unknown>,
 ): void {
   const body: ApiResponse<T> = { ok: true, data, error: null, meta };
+
+  const policy = res.locals?.cachePolicy;
+  if (policy && policy.kind !== 'no-store') {
+    let etag = res.getHeader('ETag');
+    if (!etag) {
+      const hash = sha256Hex(canonicalJson(body));
+      etag = `"${hash}"`;
+      res.setHeader('ETag', etag);
+    }
+
+    const ifNoneMatch = res.req?.headers['if-none-match'];
+    if (ifNoneMatch && checkETagMatch(ifNoneMatch, String(etag))) {
+      res.status(304).end();
+      return;
+    }
+  }
+
   res.status(statusCode).json(body);
 }
 
@@ -24,7 +44,10 @@ export function sendError(
   message: string,
   details?: Record<string, unknown>,
 ): void {
-  const error: ApiError = { code, message, details };
+  // The header is set first in the chain, so it survives lost async context.
+  const header = res.getHeader('X-Request-Id');
+  const requestId = typeof header === 'string' ? header : currentContext()?.requestId;
+  const error: ApiError = { code, message, details, requestId };
   const body: ApiResponse<null> = { ok: false, data: null, error };
   res.status(statusCode).json(body);
 }

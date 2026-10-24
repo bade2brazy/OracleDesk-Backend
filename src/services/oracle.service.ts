@@ -4,7 +4,7 @@
  */
 import { prisma } from '../lib/prisma';
 import { AppError } from '../middlewares/error.middleware';
-import { getOnChainMarket, resolverState } from './chain.service';
+import { getOnChainMarketCached, resolverStateCached } from './chain.service';
 import type { MarketStatus } from '../generated/market-core';
 
 export type MarketStatusView =
@@ -17,7 +17,7 @@ export function marketStatusView(status: MarketStatus): MarketStatusView {
   return { tag: status.tag };
 }
 
-export async function getResolutionStatus(marketId: string) {
+export async function getResolutionStatus(marketId: string, signal?: AbortSignal) {
   const market = await prisma.market.findUnique({
     where: { id: marketId },
     select: { id: true, status: true, onChainMarketId: true, resolutionHash: true, resolutionSpec: true },
@@ -27,10 +27,15 @@ export async function getResolutionStatus(marketId: string) {
     throw new AppError(409, 'MARKET_NOT_ON_CHAIN', 'Market has not been created on-chain yet');
   }
 
-  const [state, onChain] = await Promise.all([
-    resolverState(market.onChainMarketId),
-    getOnChainMarket(market.onChainMarketId),
+  const [stateRes, onChainRes] = await Promise.all([
+    resolverStateCached(market.onChainMarketId, signal),
+    getOnChainMarketCached(market.onChainMarketId, signal),
   ]);
+
+  const state = stateRes.value;
+  const onChain = onChainRes.value;
+  const ledger = Math.min(stateRes.ledger, onChainRes.ledger);
+  const cached = Boolean(stateRes.cached && onChainRes.cached);
 
   return {
     marketId: market.id,
@@ -40,5 +45,7 @@ export async function getResolutionStatus(marketId: string) {
     resolutionHash: market.resolutionHash,
     resolutionSpec: market.resolutionSpec,
     dbStatus: market.status,
+    ledger,
+    cached,
   };
 }

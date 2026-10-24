@@ -63,21 +63,89 @@ If dry-run simulated (and returned the simulated result), the bindings were
 injectable, and `agentSell` existed, `src/services/chain.service.ts` here
 could become a thin wrapper around it. Its method names already match.
 
-## 6. Adopt versioned reasoning trace schemas
+## 6. Treasury `admin()` and `is_paused()` views
 
-The contracts repo (`agents/core/trace.ts`) currently defines a `ReasoningTrace` shape without versioning:
-`{ agent: 'market-maker'|'trader', marketId: number|null, action, reasoning, inputs, timestamp: unix seconds }`.
-The backend publishes versioned traces using `schemaVersion: 1` and `kind: 'oracledesk.trace'` (`docs/trace-format.md`), validating against a published JSON Schema 2020-12 at `https://api.oracledesk.io/api/v1/schemas/trace/v1.json`.
-We request that the contracts repo:
-- Adopt the `schemaVersion: 1` / `kind: 'oracledesk.trace'` envelope or publish its own formal JSON Schema.
-- Use explicit `null` for optional fields to preserve canonical JSON byte stability.
+The admin console has to read `DataKey::Admin` and `DataKey::Paused` from the
+treasury's contract-instance storage via `getLedgerEntries`. That is a
+storage-layout workaround that breaks if the contract's keys change. Expose
+`admin() -> Address` and `is_paused() -> bool` (or include them in
+`get_config`) so clients do not depend on instance storage internals.
 
-## 7. x402 integration for confidential traces
+## 7. A dedicated `publish_report` entrypoint
 
-When `TRACE_CONFIDENTIAL=true`, premium reasoning traces pinned to IPFS are sealed inside an authenticated encrypted envelope (`oracledesk.trace.enc` v1).
-The contracts repo's x402 trace API (`x402/trace-api.ts`) should:
-- Detect `kind === 'oracledesk.trace.enc'`.
-- After payment verification, call the backend's internal key release endpoint:
-  `POST /internal/traces/:onChainTraceId/key` with shared HMAC authentication (`X402_KEY_RELEASE_SECRET`), timestamp, and nonce replay protection.
-- Decrypt the envelope using the retrieved data key and verify `sha256(plaintext) === envelope.plaintextHash` before returning the content to the paying user.
+Transparency reports use `market_id = u64::MAX` as a documented sentinel in
+`publish_trace`, because reports are not about a single market. A
+`publish_report(agent, action, trace_hash, ipfs_cid)` entrypoint (with its own
+report counter/index) would remove the sentinel hack and let
+`market_trace_count(u64::MAX)` stay a valid market-only index.
 
+## 8. Record wasm hashes in `deployments/*.json`
+
+The backend's startup spec-compat gate (#34) verifies each deployed
+contract's wasm against the bindings it was synced with. The spec itself
+comes from the chain, but there is no recorded expectation for the wasm
+*hash*: two different builds can share a spec, and a hash pin would catch a
+redeploy from an unreviewed build. Have `scripts/deploy-testnet.sh` write
+the installed wasm hashes into `deployments/testnet.json`, e.g.:
+
+```json
+"wasm_hashes": {
+  "market_core": "<hex sha256 of the installed wasm>",
+  "resolver": "…",
+  "treasury": "…",
+  "reasoning_registry": "…"
+}
+```
+
+`scripts/sync-contracts.mjs` here already copies `wasm_hashes.<contract>`
+into `src/generated/contracts-manifest.json` when present (it records
+`expectedWasmHash: null` otherwise), and the boot gate starts enforcing the
+pin as soon as the hashes appear.
+
+## Note: `publish_trace` action strings differ between repos
+
+The backend publishes traces with `create_market`, `buy_yes` and `buy_no`
+(`src/lib/trace-actions.ts`). The contracts repo's TypeScript agents use
+`create_market` and `buy`. Consumers that group traces by action should treat
+`buy` as either direction, or the two sides should agree on one vocabulary.
+
+## Note: traces now carry a `provenance` block (backend #66)
+
+Pinned trace documents gained a top-level `provenance` object
+(`oracledesk.trace.provenance/1`, see `docs/api.md` in the backend). The
+x402 service serves the pinned bytes untouched, so its consumers receive the
+block as part of `content`. They should tolerate unknown keys in the trace
+document and treat `provenance` as optional: traces pinned earlier do not have
+it. `agents/core/trace.ts` `canonicalize` needs no change; the block holds only
+strings, numbers, booleans, `null` and plain objects. The former
+`llm: { provider, model }` key is gone.
+
+## 8. A minimal SEP-45 web-auth contract (#47)
+
+The backend's contract-account login (`GET /auth/contract/challenge`,
+`POST /auth/contract/verify`) needs a deployed web-auth contract to simulate.
+Please provide the smallest contract that satisfies
+[SEP-45](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0045.md):
+
+```rust
+pub fn web_auth_verify(env: Env, args: Map<Symbol, String>) {
+    // No side effects, no state. Both parties must authorize.
+    let account: Address = args.get(symbol_short!("account")).unwrap().into();
+    let server: Address = args.get(symbol_short!("web_auth_domain_account")).unwrap().into();
+    account.require_auth();
+    server.require_auth();
+}
+```
+
+Requests:
+
+- Deploy it to testnet and record its `C…` id in
+  `deployments/testnet.json` so `scripts/sync-contracts.mjs` exposes it.
+- Keep the argument map keys exactly `account`, `home_domain`, `web_auth_domain`,
+  `web_auth_domain_account`, `nonce` (the backend sends them as a sorted
+  `ScMap<Symbol, String>` and rejects entries whose args disagree).
+
+Until it exists, `WEB_AUTH_CONTRACT_ID` can point at a community SEP-45
+web-auth contract on testnet. Risk to document: a hostile account contract can
+make `__check_auth` always succeed, but that only proves control of the contract
+being logged in, which is the identity under test.

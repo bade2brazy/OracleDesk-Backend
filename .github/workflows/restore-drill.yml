@@ -1,0 +1,62 @@
+name: Restore drill
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: oracledesk
+          POSTGRES_PASSWORD: oracledesk
+          POSTGRES_DB: oracledesk
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oracledesk"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://oracledesk:oracledesk@localhost:5432/oracledesk
+      NODE_ENV: test
+      CHAIN_EXECUTION_MODE: dry-run
+      IPFS_TRANSPORT: local
+      SEED_ALLOW_REMOTE: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - name: Seed fixture data
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/fixtures/restore-seed.sql
+      - name: Backup
+        run: BACKUP_DIR="$RUNNER_TEMP/backups" ./scripts/backup.sh
+      - name: Wipe and restore
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+          DUMP="$(find "$RUNNER_TEMP/backups" -name "oracledesk-*.dump" -type f | head -1)"
+          ./scripts/restore.sh "$DUMP" --force
+      - name: Reconcile against recorded RPC events
+        env:
+          RECONCILE_FAKE_RPC: tests/fixtures/events.json
+        run: |
+          npx tsx scripts/post-restore-reconcile.ts \
+            --manifest "$RUNNER_TEMP"/backups/oracledesk-*-manifest.json \
+            --rewind-ledgers 720 --scan-transfers \
+            --out "$RUNNER_TEMP/reconcile-report.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reconcile-report
+          path: ${{ runner.temp }}/reconcile-report.json
+          if-no-files-found: ignore

@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
+  workflow_call:
 
 jobs:
   backend:
@@ -12,7 +13,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: oracledesk
           POSTGRES_PASSWORD: oracledesk
@@ -56,5 +57,53 @@ jobs:
 
       - run: npx prisma generate
       - run: npx prisma migrate deploy
+      - name: Verify schema datamodel matches migrations
+        run: npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Audit database constraints
+        run: npx tsx scripts/audit-constraints.ts --json audit.json
       - run: npm run build
+
+      # #64: the contracts repo's x402 service runs against backend-produced
+      # traces. Its dependencies are installed from the submodule's lockfile.
+      - name: Cache x402 dependencies
+        uses: actions/cache@v4
+        with:
+          path: contracts/oracledesk-stellar/x402/node_modules
+          key: x402-node-modules-${{ runner.os }}-${{ hashFiles('contracts/oracledesk-stellar/x402/package-lock.json') }}
+      - name: Install x402 test dependencies
+        run: npm run test:x402:prepare
+
       - run: npm test
+      # #67: deterministic replay of recorded model outputs; needs no provider
+      # keys. --live is manual only and never runs in CI.
+      - name: Evaluate market generation (replay)
+        run: npm run eval:markets -- --replay
+      # #69: harness check for the dedup threshold sweep on the committed pair set.
+      - name: Calibrate dedup (fake provider)
+        run: npm run calibrate:dedup -- --provider fake
+      - name: End-to-end x402 test
+        run: npm run test:e2e:x402
+      # Integration tier (#135): real Postgres 16 + Redis 7 from the service
+      # containers above. TEST_DATABASE_URL is the admin DB, used to clone a
+      # migrated template database per test file.
+      - name: Integration tests
+        run: npm run test:integration
+        env:
+          TEST_DATABASE_URL: postgresql://oracledesk:oracledesk@localhost:5432/postgres
+          TEST_REDIS_URL: redis://localhost:6379
+
+  migrations:
+    name: Migration lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Lint new migrations
+        run: npm run lint:migrations
